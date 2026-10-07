@@ -38,15 +38,43 @@ macOS:    ~/.workbuddy/skills/gaoren-workbuddy-checkin/
 
 或直接下载 Release 里的 zip 解压到同一位置。
 
-## 三条凭据通道
+## 四条通道（v1.1.0 起默认走 D）
 
-| 通道 | 来源 | 条件 |
+| 通道 | 来源 | 凭据接触 | 条件 | 实测 |
+|---|---|---|---|---|
+| **D** | 客户端本机 RPC（wbipc 命名管道） | **零** | 客户端运行中 | 全流程 2.4~3.4s |
+| A | 本机登录态解密 | 读并解密 accessToken | 客户端运行中 | ~8s |
+| C | 环境变量 `GAOREN_ACCESS_TOKEN` | 自备 | — | 同 A |
+| B | `~/.workbuddy/gaoren-checkin/token.txt` | 自备 | — | 同 A |
+
+**通道 D 是本项目 v1.1.0 的重点**：WorkBuddy 桌面端运行时会在本机开一个 IPC 服务，
+用**它自己的登录态**代发请求，脚本只发相对路径 + JSON body，**完全不接触凭据**，
+也因此不受登录态加密格式改版影响。协议由本项目独立逆向并实现（`wbipc_client.py`）。
+
+通道 A 是备用：客户端 5.6.2 起把登录态换成 AES-256-GCM 信封，密钥只在客户端内存里，
+本项目自研实现解密（`wb_crypto.py`），全程不写盘、不打印。
+
+## 三步业务（全部幂等）
+
+| 步骤 | 做什么 | 默认 |
 |---|---|---|
-| A | 本机登录态解密（Windows） | 客户端正在运行且已登录 |
-| B | `~/.workbuddy/gaoren-checkin/token.txt` | 你自己提供 accessToken |
-| C | 环境变量 `GAOREN_ACCESS_TOKEN` | 同上 |
+| `checkin` | 每日 100 积分签到 | 执行 |
+| `streak` | 每月连签档位（查看可兑换档位） | 只读查看 |
+| `travel` | 猫猫旅行先领后派 | 执行 |
+| `lottery` | 连登抽奖 | 需 `--lottery` |
 
-客户端 5.6.2 起把登录态里的 token 换成了 AES-256-GCM 信封，加密密钥只在运行中的客户端内存里。本项目在本地取出并解密，**全程不写盘、不打印**。
+兑换（`--redeem`）与抽奖（`--lottery`）默认**不执行**——它们是消费型/随机性动作，
+替你默认做不合适。
+
+## doctor：改版后第一件事
+
+```bash
+python scripts/wb_auto_checkin.py --doctor
+```
+
+一次检查完：客户端 RPC 通道、登录态信封格式、状态/连签接口可达性、活动有效期、
+当前可兑换档位。客户端改版后先跑它，能第一时间发现问题而不是静默失效。
+版本兼容记录见 `references/compat.md`。
 
 ## 每日自动化
 

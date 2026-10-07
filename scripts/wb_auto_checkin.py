@@ -1,73 +1,170 @@
 #!/usr/bin/env python3
-"""gaoren-workbuddy-checkin · WorkBuddy Buddy 加油站每日签到（自研实现）
+"""gaoren-workbuddy-checkin · WorkBuddy 加油站每日签到（自研 v1.1.0）
 
-作者：gaoren ｜ 许可证：MIT ｜ 零第三方依赖，仅用 Python 标准库
+作者：gaoren ｜ MIT ｜ 零第三方依赖，仅用 Python 标准库
 
-三条工作通道（自动择一）：
-  A 本地登录态：解密本机登录态里的 accessToken（Windows，需客户端在运行）
-  B 令牌文件  ：读 ~/.workbuddy/gaoren-checkin/token.txt（客户端不可用时）
-  C 环境变量  ：读 GAOREN_ACCESS_TOKEN
+四条凭据/传输通道（自动择一，优先级从高到低）：
+  D 客户端本机 RPC（wbipc 命名管道）—— 零凭据，鉴权由客户端附加，不受登录态格式影响
+  A 本机登录态解密（Windows）        —— 自研 AES-256-GCM，密钥取自客户端进程内存
+  C 环境变量 GAOREN_ACCESS_TOKEN
+  B 令牌文件 ~/.workbuddy/gaoren-checkin/token.txt
+
+三步业务（全部幂等，可重复执行）：
+  ① checkin 每日签到        ② streak 每月连签档位（兑换需 --redeem）
+  ③ travel 猫猫旅行先领后派（抽奖需 --lottery）
 
 用法：
-  wb_auto_checkin.py            签到（幂等，已签则跳过），可选处理猫猫旅行
-  wb_auto_checkin.py --probe    只读探测：只查状态，绝不发起任何写请求
-  wb_auto_checkin.py --no-travel 只签到，不碰旅行
-  wb_auto_checkin.py --json     输出 JSON（给 agent 解析）
-  wb_auto_checkin.py --self-test 跑加密自测（离线）
+  wb_auto_checkin.py                 签到 + 连签查看 + 旅行
+  wb_auto_checkin.py --probe         只读探测，绝不发起任何写请求
+  wb_auto_checkin.py --doctor        环境自检（改版后第一件事）
+  wb_auto_checkin.py --redeem        额外执行连签档位兑换（消费型，默认不做）
+  wb_auto_checkin.py --lottery       额外执行连登抽奖（有随机性，默认不做）
+  wb_auto_checkin.py --json          结构化输出
+  wb_auto_checkin.py --self-test     离线加密自测
 
-安全约定：token 只在内存中使用，日志与输出里永不出现明文与前后缀。
+安全约定：任何通道都不在日志/输出里出现 token 明文或前后缀。
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import ssl
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import wb_crypto as crypto  # noqa: E402
+import wb_crypto as crypto          # noqa: E402
+from wbipc_client import (            # noqa: E402
+    WbipcClient, WbipcError, is_available, load_endpoint)
 
-APP_NAME = "gaoren-checkin"
-TRAVEL_HOST = "https://www.workbuddy.cn"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36 WorkBuddy/%s"
-      % os.environ.get("GAOREN_CLIENT_VER", "5.7.6"))
+APP_VERSION = "1.1.0"
+TRAVEL_HOST_PATH = "/activity/growth/buddy/travel"
+# 结果契约：每一步的合法状态集合（agent 只按这张表判断，不要自行推理）
+STATUS_SET = {
+    "checkin": ("success", "already_checked", "skipped"),
+    "streak": ("ready", "redeemed", "locked", "skipped"),
+    "lottery": ("drawn", "no_chance", "skipped"),
+    "travel": ("departed", "arrived_claimed", "claimed", "traveling",
+               "idle_limit", "skipped"),
+}
 
-# 余额字段候选名（接口在不同版本用过单数/复数）
-BALANCE_KEYS = ("total_credits", "total_credit", "balance", "credits", "credit")
-
-
-# ---------------------------------------------------------------------------
-# 基础工具
-# ---------------------------------------------------------------------------
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log_line(path: str, line: str) -> None:
-    """追加一行日志（默认脱敏，绝不写 token）。"""
+def home_dir() -> str:
+    return os.environ.get("GAOREN_HOME") or os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "gaoren-checkin")
+
+
+def log_path() -> str:
+    return os.environ.get("GAOREN_CHECKIN_LOG") or os.path.join(home_dir(), "checkin.log")
+
+
+def write_log(line: str) -> None:
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+        with open(log_path(), "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
     except OSError:
         pass
 
 
-def default_log() -> str:
-    env = os.environ.get("GAOREN_CHECKIN_LOG")
-    if env:
-        return env
-    home = os.environ.get("GAOREN_HOME") or os.path.join(
-        os.path.expanduser("~"), ".workbuddy", "gaoren-checkin")
-    return os.path.join(home, "checkin.log")
+# ---------------------------------------------------------------------------
+# 传输层
+# ---------------------------------------------------------------------------
+
+class Transport:
+    name = "?"
+
+    def request(self, method: str, path: str, body: dict | None = None,
+                query: dict | None = None) -> tuple[int, dict]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class WbipcTransport(Transport):
+    """通道 D：走客户端本机 RPC，鉴权由客户端附加。"""
+
+    name = "wbipc"
+
+    def __init__(self) -> None:
+        endpoint, ticket = load_endpoint()
+        self.c = WbipcClient(endpoint, ticket)
+        self.c.handshake()
+        self.channel = self.c.get_pipe()
+
+    def request(self, method, path, body=None, query=None):
+        res = self.c.http(method, path, body, query, channel=self.channel)
+        raw = res.get("body_b64") or ""
+        try:
+            data = json.loads(base64.b64decode(raw).decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            data = {}
+        return int(res.get("status") or 0), data
+
+    def close(self) -> None:
+        self.c.close()
+
+
+class HttpTransport(Transport):
+    """通道 A/B/C：自带 accessToken 直连官方接口（连接复用，省 TLS 握手）。"""
+
+    def __init__(self, token: str, domain: str, label: str) -> None:
+        self.name = label
+        self.token = token
+        self.domain = domain
+        self._conn: http.client.HTTPSConnection | None = None
+
+    def _connection(self) -> http.client.HTTPSConnection:
+        if self._conn is None:
+            self._conn = http.client.HTTPSConnection(
+                self.domain, timeout=20, context=ssl.create_default_context())
+        return self._conn
+
+    def request(self, method, path, body=None, query=None):
+        url = path
+        if query:
+            url += "?" + urllib.parse.urlencode(
+                {k: str(v) for k, v in query.items()})
+        payload = json.dumps(body or {}).encode("utf-8") if method == "POST" else None
+        headers = {
+            "Authorization": "Bearer %s" % self.token,
+            "Accept": "application/json",
+            "User-Agent": os.environ.get("GAOREN_UA", "WorkBuddy-CLI/%s" % APP_VERSION),
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        for attempt in (1, 2):
+            try:
+                conn = self._connection()
+                conn.request(method, url, body=payload, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read().decode("utf-8", "replace")
+                return resp.status, (json.loads(raw) if raw.strip() else {})
+            except (http.client.HTTPException, OSError) as exc:
+                self.close()
+                if attempt == 2:
+                    return 0, {"msg": "网络错误：%s" % exc}
+        return 0, {"msg": "未知网络错误"}
+
+    def close(self) -> None:
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except OSError:
+            pass
+        finally:
+            self._conn = None
 
 
 def login_state_path() -> str:
@@ -76,192 +173,284 @@ def login_state_path() -> str:
         return env
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "CodeBuddyExtension", "Data", "Public",
-                            "auth", "workbuddy-desktop.info")
+        return os.path.join(base, "CodeBuddyExtension", "Data", "Public", "auth",
+                            "workbuddy-desktop.info")
     if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/"
-                                  "CodeBuddyExtension/Data/Public/auth/"
-                                  "workbuddy-desktop.info")
-    return os.path.expanduser("~/.config/CodeBuddyExtension/Data/Public/"
-                              "auth/workbuddy-desktop.info")
+        return os.path.expanduser("~/Library/Application Support/CodeBuddyExtension"
+                                  "/Data/Public/auth/workbuddy-desktop.info")
+    return os.path.expanduser("~/.config/CodeBuddyExtension/Data/Public/auth/"
+                              "workbuddy-desktop.info")
 
 
-def _unprotected(value):
-    """兼容 5.6.2 前后的两种登录态：明文字符串 / 加密信封。"""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict) and value.get("envelope"):
-        return None      # 需要密钥，交给调用方解密
-    return None
-
-
-def read_local_credentials() -> tuple[str | None, str | None, str]:
-    """返回 (access_token, domain, 来源说明)。拿不到就返回 (None, None, 原因)。"""
-    # 通道 C：环境变量
-    env_token = os.environ.get("GAOREN_ACCESS_TOKEN")
-    if env_token and env_token.count(".") == 2:
-        return env_token, os.environ.get("GAOREN_AUTH_DOMAIN", "www.codebuddy.cn"), "环境变量"
-
-    # 通道 B：令牌文件
-    token_file = os.path.join(os.environ.get("GAOREN_HOME") or os.path.join(
-        os.path.expanduser("~"), ".workbuddy", "gaoren-checkin"), "token.txt")
-    if os.path.isfile(token_file):
+def open_transport(prefer: str = "auto") -> tuple[Transport | None, str]:
+    """按优先级选通道，返回 (transport, 说明)。"""
+    order = [prefer] if prefer != "auto" else ["D", "A", "C", "B"]
+    for ch in order:
         try:
-            tok = open(token_file, encoding="utf-8").read().strip()
-            if tok.count(".") == 2:
-                dom = ""
-                dom_file = os.path.join(os.path.dirname(token_file), "domain.txt")
-                if os.path.isfile(dom_file):
-                    dom = open(dom_file, encoding="utf-8").read().strip()
-                return tok, dom or "www.codebuddy.cn", "令牌文件"
-        except OSError:
-            pass
+            if ch == "D":
+                t = WbipcTransport()
+                return t, "客户端本机 RPC（零凭据）"
+            if ch == "A":
+                tok, dom, src = _from_login_state()
+                if tok:
+                    return HttpTransport(tok, dom, "direct"), "登录态解密（%s）" % src
+            elif ch == "C":
+                tok = os.environ.get("GAOREN_ACCESS_TOKEN", "").strip()
+                if tok.count(".") == 2:
+                    return HttpTransport(tok, os.environ.get("GAOREN_AUTH_DOMAIN",
+                                      "www.codebuddy.cn"), "direct"), "环境变量"
+            elif ch == "B":
+                f = os.path.join(home_dir(), "token.txt")
+                if os.path.isfile(f):
+                    tok = open(f, encoding="utf-8").read().strip()
+                    if tok.count(".") == 2:
+                        dom = "www.codebuddy.cn"
+                        df = os.path.join(home_dir(), "domain.txt")
+                        if os.path.isfile(df):
+                            dom = open(df, encoding="utf-8").read().strip() or dom
+                        return HttpTransport(tok, dom, "direct"), "令牌文件"
+        except (WbipcError, OSError, ValueError, KeyError):
+            continue
+    return None, "无可用通道"
 
-    # 通道 A：本机登录态
+
+def _from_login_state() -> tuple[str | None, str, str]:
     path = login_state_path()
     if not os.path.isfile(path):
-        return None, None, "找不到登录态文件"
-    try:
-        state = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return None, None, "登录态读取失败：%s" % exc
-
+        return None, "", "找不到登录态"
+    state = json.load(open(path, encoding="utf-8"))
     auth = state.get("auth") or {}
     domain = auth.get("domain") or "www.codebuddy.cn"
     raw = auth.get("accessToken")
-    plain = _unprotected(raw)
-    if plain:
-        return plain, domain, "登录态（明文）"
-
+    if isinstance(raw, str) and raw:
+        return raw, domain, "明文"
     if not isinstance(raw, dict) or not raw.get("envelope"):
-        return None, None, "登录态里没有 accessToken"
-
-    try:
-        env = json.loads(base64.b64decode(raw["envelope"]))
-    except (ValueError, TypeError):
-        return None, None, "信封解析失败"
-    key_id = env.get("keyId")
-    if not key_id:
-        return None, None, "信封缺少 keyId"
-
-    key, source = crypto.obtain_key(key_id, data_dir=os.path.dirname(path),
+        return None, "", "登录态无 accessToken"
+    env = json.loads(base64.b64decode(raw["envelope"]))
+    key, source = crypto.obtain_key(env["keyId"], data_dir=os.path.dirname(path),
                                     verbose=bool(os.environ.get("GAOREN_VERBOSE")))
     if not key:
-        return None, None, ("取不到运行时密钥（客户端是否在运行？"
-                            "或用 GAOREN_ACCESS_TOKEN / token.txt 提供令牌）")
+        return None, "", "取不到运行时密钥"
     try:
-        token = crypto.open_envelope(raw["envelope"], key)
+        return crypto.open_envelope(raw["envelope"], key), domain, "解密/密钥来自%s" % source
     except (ValueError, KeyError) as exc:
-        return None, None, "登录态解密失败：%s" % exc
-    return token, domain, "登录态（解密，密钥来自%s）" % source
+        return None, "", "解密失败：%s" % exc
 
 
 # ---------------------------------------------------------------------------
-# HTTP
+# 业务
 # ---------------------------------------------------------------------------
 
-def http_json(url: str, token: str, method: str = "POST", body: dict | None = None,
-              timeout: int = 20) -> tuple[int, dict]:
-    data = json.dumps(body or {}).encode() if method == "POST" else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", "Bearer %s" % token)
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", UA)
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw.strip() else {})
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        try:
-            return exc.code, json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            return exc.code, {"msg": raw[:200]}
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return 0, {"msg": "网络错误：%s" % exc}
+def api(t: Transport, method: str, path: str, body: dict | None = None) -> dict:
+    status, data = t.request(method, path, body)
+    if status == 0:
+        raise RuntimeError(data.get("msg") or "请求失败")
+    if status == 401:
+        raise RuntimeError("登录态失效（HTTP 401），请打开 WorkBuddy 客户端刷新后重试")
+    return data
 
 
-def pick(data: dict, *names, default=None):
+def pick(d: dict, *names, default=None):
     for n in names:
-        if isinstance(data, dict) and data.get(n) is not None:
-            return data[n]
+        if isinstance(d, dict) and d.get(n) is not None:
+            return d[n]
     return default
 
 
-# ---------------------------------------------------------------------------
-# 业务动作
-# ---------------------------------------------------------------------------
-
-def fetch_status(token: str, domain: str) -> dict:
-    url = "https://%s/v2/billing/meter/checkin-activity-status" % domain
-    code, body = http_json(url, token)
-    if code != 200:
-        raise RuntimeError("状态查询失败 HTTP %s：%s" % (code, body.get("msg", "")))
-    return body
-
-
-def do_claim(token: str, domain: str) -> dict:
-    url = "https://%s/v2/billing/meter/daily-checkin" % domain
-    http, body = http_json(url, token)
-    code = body.get("code")
-    msg = str(body.get("msg") or "")
-    data = body.get("data") if isinstance(body.get("data"), dict) else {}
-    already = (code == 10001 or "已签到" in msg
-               or (http == 400 and "已签到" in msg))
-    if http == 200 and code == 0:
-        return {"action": "claimed",
-                "credit": pick(data, "credit") or body.get("credit"),
-                "streak": pick(data, "streak_days") or body.get("streak_days")}
-    if already:
-        return {"action": "skip_already_signed", "credit": 0,
-                "streak": pick(data, "streak_days"), "msg": msg}
-    raise RuntimeError("领取失败 HTTP %s code=%s：%s" % (http, code, msg or body))
+def step_checkin(t: Transport) -> dict:
+    # 先直接领（省一次请求）；只有拿到非预期错误时才回查状态判断原因。
+    res = api(t, "POST", "/v2/billing/meter/daily-checkin")
+    code = res.get("code")
+    msg = str(res.get("msg") or "")
+    if code == 0:
+        data = res.get("data") or {}
+        return {"name": "checkin", "status": "success",
+                "credit": pick(data, "credit") or res.get("credit"),
+                "streak_days": pick(data, "streak_days") or res.get("streak_days")}
+    if code == 10001 or "已签到" in msg:
+        return {"name": "checkin", "status": "already_checked", "detail": msg or "今日已签到"}
+    # 异常路径：回查一次，确认是活动结束还是别的问题
+    try:
+        st = api(t, "POST", "/v2/billing/meter/checkin-activity-status")
+        d = st.get("data") or {}
+        if d.get("active") is False:
+            return {"name": "checkin", "status": "skipped",
+                    "detail": "本期活动已结束（active=false）"}
+    except RuntimeError:
+        pass
+    return {"name": "checkin", "status": "error", "code": code, "detail": msg}
 
 
-def handle_travel(token: str, allow_depart: bool = True) -> dict:
-    """先领后派：已到达先领取；空闲且未达上限才派遣（不满足则完全不发写请求）。"""
-    out: dict = {"note": ""}
-    http, body = http_json(TRAVEL_HOST + "/activity/growth/buddy/travel/status",
-                           token, method="GET")
-    if http != 200 or body.get("code") != 0:
-        out["note"] = "旅行状态查询失败"
+def step_streak(t: Transport, do_redeem: bool = False) -> dict:
+    res = api(t, "GET", "/activity/growth/streak")
+    d = res.get("data") or {}
+    s = d.get("streak") or {}
+    rs = d.get("redemption_status") or {}
+    out = {"name": "streak", "status": "ready", "days": s.get("days"),
+           "next_tier": s.get("next_tier"), "remaining": s.get("next_tier_remaining"),
+           "makeup_cards": pick(d, "makeup_cards", default={}).get("balance")
+           if isinstance(d.get("makeup_cards"), dict) else None}
+    if not do_redeem:
+        ready = [k[5:-7] for k in rs
+                 if k.endswith("_status") and rs.get(k) == "available"
+                 and rs.get(k.replace("_status", "_count"), 0) == 0]
+        out["redeemable"] = ready
         return out
-    d = body.get("data") or {}
-    state = d.get("state")
-    out["state"] = state
-    out["reward_credit"] = d.get("reward_credit")
-    out["daily_limit_reached"] = d.get("daily_limit_reached")
-
-    if state == "arrived":
-        hc, bc = http_json(TRAVEL_HOST + "/activity/growth/buddy/travel/claim", token)
-        out["claim"] = "ok" if hc == 200 and bc.get("code") == 0 else \
-            "failed:%s" % (bc.get("msg") or hc)
-    if state == "idle" and allow_depart and not d.get("daily_limit_reached"):
-        hc, bc = http_json(TRAVEL_HOST + "/activity/growth/buddy/travel/depart",
-                           token, body={"location_id": 1})
-        out["depart"] = "ok" if hc == 200 and bc.get("code") == 0 else \
-            "failed:%s" % (bc.get("msg") or hc)
-    elif state == "idle":
-        out["note"] = "今日派遣次数已用完，未发派遣请求"
+    redeemed = []
+    for tier in ("7d", "14d", "28d"):
+        if rs.get("tier_%s_status" % tier) == "available" and \
+                not rs.get("tier_%s_count" % tier):
+            r = api(t, "POST", "/activity/growth/redeem",
+                    {"tier": tier, "client_token": str(uuid.uuid4())})
+            if r.get("code") == 0:
+                redeemed.append({"tier": tier,
+                                 "credit": pick(r.get("data") or {}, "credit")})
+    out["redeemed"] = redeemed
+    out["status"] = "redeemed" if redeemed else "locked"
     return out
 
 
-def summarize(status_body: dict) -> dict:
-    data = status_body.get("data") or {}
-    return {
-        "active": data.get("active"),
-        "today_checked_in": data.get("today_checked_in"),
-        "streak_days": data.get("streak_days"),
-        "daily_credit": data.get("daily_credit"),
-        "today_credit": data.get("today_credit"),
-        "balance": pick(data, *BALANCE_KEYS),
-        "end_time": data.get("end_time"),
-        "is_streak_day": data.get("is_streak_day"),
-        "streak_bonus_credit": data.get("streak_bonus_credit"),
-        "streak_bonus_days": data.get("streak_bonus_days"),
-    }
+def step_lottery(t: Transport, do_draw: bool = False) -> dict:
+    if not do_draw:
+        return {"name": "lottery", "status": "skipped", "detail": "未加 --lottery"}
+    res = api(t, "GET", "/activity/growth/lottery/summary")
+    chances = pick(res.get("data") or {}, "chances", default=0)
+    if not chances:
+        return {"name": "lottery", "status": "no_chance", "chances": 0}
+    r = api(t, "POST", "/activity/growth/lottery/draw",
+            {"client_token": str(uuid.uuid4())})
+    if r.get("code") == 0:
+        return {"name": "lottery", "status": "drawn",
+                "prize": pick(r.get("data") or {}, "prize_name")}
+    return {"name": "lottery", "status": "error", "detail": str(r.get("msg") or "")}
+
+
+def step_travel(t: Transport, do_depart: bool = True) -> dict:
+    res = api(t, "GET", TRAVEL_HOST_PATH + "/status")
+    d = res.get("data") or {}
+    state = d.get("state")
+    out = {"name": "travel", "status": "skipped", "state": state,
+           "reward_credit": d.get("reward_credit"),
+           "daily_limit_reached": d.get("daily_limit_reached")}
+    if state == "arrived":
+        r = api(t, "POST", TRAVEL_HOST_PATH + "/claim")
+        out["status"] = "claimed" if r.get("code") == 0 else "error"
+        if r.get("code") != 0:
+            out["detail"] = str(r.get("msg") or "")
+        return out
+    if state == "traveling":
+        out["status"] = "traveling"
+        out["arrive_at"] = d.get("arrive_at")
+        return out
+    if state == "idle":
+        if not do_depart:
+            out["detail"] = "未启用派遣"
+            return out
+        if d.get("daily_limit_reached"):
+            out["status"] = "idle_limit"
+            return out
+        r = api(t, "POST", TRAVEL_HOST_PATH + "/depart", {"location_id": 1})
+        out["status"] = "departed" if r.get("code") == 0 else "error"
+        if r.get("code") != 0:
+            out["detail"] = str(r.get("msg") or "")
+        return out
+    return out
+
+
+def read_balance(t: Transport, with_resource: bool = True) -> dict:
+    """两个口径分开报：加油站积分（total_credits）与资源额度（Packages 剩余）。
+
+    with_resource=False 时跳过资源额度查询（省一次请求，输出里就没有该字段）。
+    """
+    out = {}
+    try:
+        st = api(t, "POST", "/v2/billing/meter/checkin-activity-status")
+        d = st.get("data") or {}
+        out["checkin_balance"] = pick(d, "total_credits", "total_credit", "balance")
+        out["streak_days"] = d.get("streak_days")
+        out["end_time"] = d.get("end_time")
+        out["active"] = d.get("active")
+    except RuntimeError:
+        pass
+    if not with_resource:
+        return out
+    try:
+        rs = api(t, "POST", "/billing/meter/get-user-resource-summary")
+        pk = (rs.get("data") or {}).get("Packages") or []
+        total = 0.0
+        for p in pk:
+            try:
+                total += float(p.get("CycleRemainCapacity") or 0)
+            except (TypeError, ValueError):
+                pass
+        out["resource_credits"] = round(total, 2)
+    except RuntimeError:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+def doctor() -> int:
+    checks: list[tuple[str, bool, str]] = []
+    print("gaoren-workbuddy-checkin %s ｜ 环境自检 %s\n" % (APP_VERSION, now()))
+
+    ok, msg = is_available()
+    checks.append(("客户端本机 RPC 通道", ok, msg))
+    print("  %s 通道 D（客户端 RPC）：%s" % ("✅" if ok else "❌", msg))
+
+    path = login_state_path()
+    exists = os.path.isfile(path)
+    detail = path if exists else "未找到（通道 D 可用时不影响）"
+    if exists:
+        try:
+            state = json.load(open(path, encoding="utf-8"))
+            raw = (state.get("auth") or {}).get("accessToken")
+            if isinstance(raw, dict) and raw.get("envelope"):
+                env = json.loads(base64.b64decode(raw["envelope"]))
+                detail = "信封 suite=%s keyId=%s" % (env.get("suite"), env.get("keyId"))
+                checks.append(("登录态信封格式", env.get("suite") == 1, detail))
+                print("  ✅ 登录态信封：suite=%s（AES-256-GCM）" % env.get("suite"))
+            else:
+                detail = "明文登录态（客户端 < 5.6.2）"
+                print("  ⚠️ 登录态：明文（客户端可能低于 5.6.2）")
+        except (OSError, ValueError) as exc:
+            detail = "解析失败：%s" % exc
+            print("  ❌ 登录态解析失败：%s" % exc)
+    else:
+        print("  ⚠️ 登录态：%s" % detail)
+
+    t, label = open_transport()
+    if not t:
+        print("\n结论：❌ 四条通道都不可用，无法执行。")
+        return 3
+    try:
+        print("\n  使用通道：%s（%s）" % (t.name, label))
+        bal = read_balance(t)
+        checks.append(("接口连通", True, label))
+        print("  ✅ 状态接口可达：连续 %s 天｜加油站余额 %s｜资源额度 %s"
+              % (bal.get("streak_days"), bal.get("checkin_balance"),
+                 bal.get("resource_credits")))
+        if bal.get("active") is False:
+            print("  ⚠️ 活动已结束（active=false），签到接口会跳过领取")
+        elif bal.get("end_time"):
+            print("  ℹ️ 活动截止：%s" % bal["end_time"])
+        try:
+            s = step_streak(t)
+            print("  ✅ 连签接口可达：已连 %s 天，下一档 %s（还差 %s 天）"
+                  % (s.get("days"), s.get("next_tier"), s.get("remaining")))
+            if s.get("redeemable"):
+                print("     ℹ️ 当前可兑换档位：%s（加 --redeem 才会兑换）"
+                      % ",".join(s["redeemable"]))
+        except RuntimeError as exc:
+            print("  ⚠️ 连签接口：%s" % exc)
+    finally:
+        t.close()
+
+    print("\n结论：%s" % ("✅ 环境正常" if any(c[1] for c in checks) else "❌ 不可用"))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -270,88 +459,109 @@ def summarize(status_body: dict) -> dict:
 
 def run(args) -> int:
     t0 = time.time()
-    log = default_log()
-    token, domain, source = read_local_credentials()
-    if not token:
-        print("❌ 无法取得凭据：%s" % source)
-        print("   客户端需处于运行登录状态；也可把 accessToken 写入 "
-              "~/.workbuddy/gaoren-checkin/token.txt")
-        log_line(log, "%s | status=error | msg=%s" % (now(), source))
+    t, label = open_transport(args.channel)
+    if not t:
+        print("❌ 四条通道都不可用。\n"
+              "   通道 D 需要 WorkBuddy 客户端在运行；否则请把 accessToken 写入\n"
+              "   %s 或设置 GAOREN_ACCESS_TOKEN。\n"
+              "   先跑 --doctor 看诊断。" % os.path.join(home_dir(), "token.txt"))
+        write_log("%s | status=error | msg=no_channel" % now())
         return 3
-
+    anomalies: list[str] = []
     try:
-        status_body = fetch_status(token, domain)
-    except RuntimeError as exc:
-        print("❌ %s" % exc)
-        log_line(log, "%s | status=error | msg=%s" % (now(), exc))
-        return 1
+        if args.probe:
+            bal = read_balance(t)
+            out = {"mode": "probe", "ok": True, "channel": t.name, "source": label,
+                   **bal, "version": APP_VERSION}
+            print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else
+                  "✅ 探测通过｜通道 %s｜连续 %s 天｜加油站余额 %s｜资源额度 %s"
+                  % (t.name, bal.get("streak_days"), bal.get("checkin_balance"),
+                     bal.get("resource_credits")))
+            write_log("%s | status=ok | action=probe | channel=%s | streak=%s | balance=%s"
+                      % (now(), t.name, bal.get("streak_days"), bal.get("checkin_balance")))
+            return 0
 
-    info = summarize(status_body)
+        steps: list[dict] = []
+        try:
+            steps.append(step_checkin(t))
+        except RuntimeError as exc:
+            steps.append({"name": "checkin", "status": "error", "detail": str(exc)})
+        if not args.no_streak:
+            try:
+                steps.append(step_streak(t, args.redeem))
+            except RuntimeError as exc:
+                steps.append({"name": "streak", "status": "error", "detail": str(exc)})
+        else:
+            steps.append({"name": "streak", "status": "skipped", "detail": "未禁用"})
+        try:
+            steps.append(step_lottery(t, args.lottery))
+        except RuntimeError as exc:
+            steps.append({"name": "lottery", "status": "error", "detail": str(exc)})
+        if not args.no_travel:
+            try:
+                steps.append(step_travel(t, not args.no_depart))
+            except RuntimeError as exc:
+                steps.append({"name": "travel", "status": "error", "detail": str(exc)})
+        else:
+            steps.append({"name": "travel", "status": "skipped", "detail": "未禁用"})
 
-    # --probe：只读，到此为止
-    if args.probe:
-        result = {"mode": "probe", "status": "ok", "source": source,
-                  "domain": domain, "token_len": len(token), **info}
-        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
-              "✅ 探测通过｜来源 %s｜域名 %s｜今日已签 %s｜连续 %s 天｜余额 %s"
-              % (source, domain, info["today_checked_in"],
-                 info["streak_days"], info["balance"]))
-        log_line(log, "%s | status=ok | action=probe | streak=%s | balance=%s | src=%s"
-                 % (now(), info["streak_days"], info["balance"], source))
+        for s in steps:
+            legal = STATUS_SET.get(s["name"], ())
+            if s.get("status") not in legal:
+                s["status"] = "error"
+                anomalies.append("%s 状态不在合法集合：%r" % (s["name"], s.get("status")))
+            elif s["status"] == "error":
+                anomalies.append("%s 失败：%s" % (s["name"], s.get("detail") or s.get("code")))
+
+        bal = read_balance(t, with_resource=args.json)
+        ok = not anomalies
+        result = {"ok": ok, "version": APP_VERSION, "channel": t.name, "source": label,
+                  "steps": steps, "anomalies": anomalies,
+                  "balance": bal.get("checkin_balance"),
+                  "resource_credits": bal.get("resource_credits"),
+                  "streak_days": bal.get("streak_days"),
+                  "elapsed": round(time.time() - t0, 2)}
+
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            for s in steps:
+                extra = " ".join("%s=%s" % (k, v) for k, v in s.items()
+                                 if k not in ("name", "status"))
+                print("  %-8s %-16s %s" % (s["name"], s["status"], extra))
+            print("通道 %s｜连续 %s 天｜余额 %s｜%.2fs"
+                  % (t.name, result["streak_days"], result["balance"],
+                     result["elapsed"]))
+            for a in anomalies:
+                print("  ⚠️ %s" % a)
+
+        write_log("%s | status=%s | channel=%s | steps=%s | balance=%s | %.2fs"
+                  % (now(), "ok" if ok else "warn", t.name,
+                     ",".join("%s:%s" % (s["name"], s["status"]) for s in steps),
+                     bal.get("checkin_balance"), time.time() - t0))
         return 0
-
-    try:
-        claim = do_claim(token, domain)
-    except RuntimeError as exc:
-        print("❌ %s" % exc)
-        log_line(log, "%s | status=error | action=claim_failed | msg=%s"
-                 % (now(), exc))
-        return 1
-
-    travel = {} if args.no_travel else handle_travel(token, allow_depart=not args.no_depart)
-
-    # 领取后再查一次状态，拿权威余额（领取成功时打印的余额是领取前的值）
-    try:
-        after = summarize(fetch_status(token, domain))
-    except RuntimeError:
-        after = {}
-    balance = after.get("balance", info.get("balance"))
-    streak = after.get("streak_days") or claim.get("streak") or info["streak_days"]
-
-    result = {"mode": "run", "status": "ok", "action": claim["action"],
-              "credit": claim.get("credit"), "streak_days": streak,
-              "balance": balance, "source": source, "domain": domain,
-              "before": info, "travel": travel,
-              "elapsed": round(time.time() - t0, 2)}
-
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        head = {"claimed": "✅ 领取成功", "skip_already_signed": "☑️ 今日已签到，跳过"}[
-            claim["action"]]
-        print("%s +%s 分｜连续 %s 天｜余额 %s" %
-              (head, claim.get("credit") or 0, streak, balance))
-        if travel:
-            print("   猫猫旅行：%s" % json.dumps(travel, ensure_ascii=False))
-
-    log_line(log, "%s | status=ok | action=%s | credit=%s | streak=%s | balance=%s "
-                  "| src=%s | travel=%s | %.1fs"
-             % (now(), claim["action"], claim.get("credit"), streak, balance,
-                source, json.dumps(travel, ensure_ascii=False) if travel else "-",
-                time.time() - t0))
-    return 0
+    finally:
+        t.close()
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="WorkBuddy 加油站自动签到（自研）")
-    p.add_argument("--probe", action="store_true", help="只读探测，不发任何写请求")
-    p.add_argument("--no-travel", action="store_true", help="不处理猫猫旅行")
-    p.add_argument("--no-depart", action="store_true", help="不派遣，只领已达成的奖励")
-    p.add_argument("--json", action="store_true", help="以 JSON 输出")
-    p.add_argument("--self-test", action="store_true", help="跑加密自测（离线）")
+    p.add_argument("--probe", action="store_true", help="只读探测，不发写请求")
+    p.add_argument("--doctor", action="store_true", help="环境自检")
+    p.add_argument("--channel", default="auto", choices=["auto", "D", "A", "C", "B"],
+                   help="指定通道，默认自动")
+    p.add_argument("--redeem", action="store_true", help="执行连签档位兑换（消费型）")
+    p.add_argument("--lottery", action="store_true", help="执行连登抽奖（有随机性）")
+    p.add_argument("--no-streak", action="store_true")
+    p.add_argument("--no-travel", action="store_true")
+    p.add_argument("--no-depart", action="store_true", help="不派遣，只领已到达的")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
     if args.self_test:
         return crypto.self_test()
+    if args.doctor:
+        return doctor()
     try:
         return run(args)
     except KeyboardInterrupt:

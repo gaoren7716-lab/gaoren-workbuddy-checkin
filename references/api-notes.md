@@ -107,3 +107,95 @@ for i in range(128):
 - 旅行接口域名是 `www.workbuddy.cn`，路径不带 `/v2`
 - 请求头：`Authorization: Bearer <token>` + `Content-Type: application/json`
 - 派遣前置条件：`state == "idle"` 且 `daily_limit_reached` 为假，任一不满足就完全不发写请求
+
+---
+
+## 5. 客户端本机 RPC 通道（wbipc，v1.1.0 新增，通道 D）
+
+这是本 Skill 目前的**首选通道**：客户端在自己机器上开一个 IPC 服务，用它自己的登录态
+代发 HTTP 请求，脚本**完全不接触凭据**。
+
+### 通道描述文件
+
+```
+<配置目录>/wbipc/endpoint.json     # 配置目录默认 ~/.workbuddy，可用 WORKBUDDY_CONFIG_DIR 覆盖
+```
+
+| 字段 | 含义 |
+|---|---|
+| `endpoint` | Windows 命名管道 `\\.\pipe\wbipc-<实例ID>`；POSIX 为 unix socket 路径 |
+| `ticket` | 本次会话的握手密钥，**不是账号凭据** |
+
+### 帧格式：换行分隔的 JSON（无长度前缀）
+
+这一点容易踩坑：同一客户端里的「浏览器桥」用的是 4 字节小端长度前缀，而 wbipc **不是**——
+它是 `JSON.stringify(x) + "\n"`，对端按 `\n` 切分，空行跳过。
+
+### 握手（四步）
+
+```
+→ {"type":"session_hello","protocol_min":1,"protocol_max":1,
+   "client_nonce":"<b64url>","ticket_id":"<sha256(ticket)[:16]>","client":{...}}
+← {"type":"session_challenge","protocol":1,"server_nonce":"...","server_proof":"..."}
+→ {"type":"session_prove","client_proof":"..."}
+← {"type":"session_hello_ack","protocol":1,"connection_epoch":"...","pipes":[...]}
+```
+
+证明值构造（自己实现时按此复现）：
+
+```
+msg   = 对每个字段 [ 'wbipc-c'|'wbipc-s', '1', endpoint, client_nonce, server_nonce ]
+        逐个「4 字节大端长度 + utf8 字节」拼接
+proof = HMAC-SHA256(key = ticket 的 utf8, msg) → base64url
+```
+
+服务端标签用 `wbipc-s`，客户端标签用 `wbipc-c`。`ticket_id = sha256(ticket)[:16]`（小写 hex）。
+
+### 调用
+
+```
+→ {"id":1,"method":"broker/GetPipe","params":{"pipe":"wb.request"}}
+← {"jsonrpc":"2.0","id":1,"result":{"channel":"c:wb.request","methods":[...]}}
+→ {"id":2,"method":"c:wb.request/http.fetch","mode":"call","params":{...}}
+← {"jsonrpc":"2.0","id":2,"result":{"status":200,"headers":{...},"body_b64":"..."}}
+```
+
+`http.fetch` 的 params 约束（服务端会校验）：
+
+- `path` 必须是相对路径、以 `/` 开头，不能含 `?` `#` `..`、不能有空白与控制字符
+- 查询参数走 `query`（值必须是字符串），不要拼进 path
+- `headers` 只允许 `content-type` 与 `accept`
+- 方法限 GET/HEAD/POST/PUT/PATCH/DELETE，body 走 `body_b64`
+
+**鉴权由客户端自动附加**，脚本不提供也不应提供 `Authorization` / UA。
+
+## 6. 每月连签与抽奖（v1.1.0 新增）
+
+| 用途 | 方法 | 路径 |
+|---|---|---|
+| 连签状态 | GET | `/activity/growth/streak` |
+| 档位兑换 | POST | `/activity/growth/redeem`　body `{"tier":"7d","client_token":"<uuid4>"}` |
+| 抽奖次数 | GET | `/activity/growth/lottery/summary` |
+| 抽奖 | POST | `/activity/growth/lottery/draw`　body `{"client_token":"<uuid4>"}` |
+
+连签状态里的关键字段（2026-10-07 实测）：
+
+- `streak.days` = 7（本周期连签天数，**与签到的 `streak_days` 不是同一个计数器**）
+- `redemption_status.tier_7d_status`：`available` 可兑换 → 兑换后变 `claimed`
+- `redemption_status.tier_7d_count`：已兑换次数，>0 表示不能再兑
+- `makeup_cards.balance`：补签卡余额
+- `tiers[]`：各档位奖励（实测 7d → 能量2/补签卡1/抽奖1 次，**积分 0**；
+  14d → 积分 50；28d → 积分 150）
+
+**为什么兑换和抽奖要显式开关**：这两步是**消费型/随机性**动作，替用户默认执行不合适，
+所以默认只读展示，需要时显式加 `--redeem` / `--lottery`。
+
+## 7. 余额有两个口径，别混
+
+| 口径 | 来源 | 2026-10-07 实测 |
+|---|---|---|
+| 加油站积分 | 状态接口 `data.total_credits` | 800 |
+| 资源额度 | `POST /billing/meter/get-user-resource-summary` → `Σ Packages[].CycleRemainCapacity` | 3750.46 |
+
+两个数**不是一回事**（8 天 × 100 = 800 只对应第一个）。写收益时要说清用的是哪个口径。
+另外该资源接口路径**没有 `/v2` 前缀**，与签到接口不同。
