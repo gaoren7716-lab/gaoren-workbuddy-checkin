@@ -1,11 +1,11 @@
 ---
 slug: gaoren-workbuddy-checkin
-displayName: WorkBuddy 自动签到（自研版·完整版）
+displayName: WorkBuddy 自动签到（自研版）
 name: gaoren-workbuddy-checkin
 display_name: WorkBuddy 自动签到（自研版）
 display_name_en: WorkBuddy Auto Check-in (Own Build)
 summary: WorkBuddy 加油站每日签到 + 每月连签 + 猫猫旅行。自研实现，纯 Python 标准库（自写 AES-256-GCM 与客户端 RPC 协议），零第三方依赖，MIT 许可。四条通道自动择一，默认走客户端本机 RPC 零凭据；带 doctor 自检、只读探测与结果契约。
-version: 1.2.0
+version: 1.2.1
 author: gaoren
 license: MIT
 homepage: https://github.com/gaoren7716-lab/gaoren-workbuddy-checkin

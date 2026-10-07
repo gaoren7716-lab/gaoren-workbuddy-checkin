@@ -21,8 +21,8 @@ import shutil
 import sys
 
 KEEP = {
-    "SKILL.md": "SKILL.md",
-    "README.md": "README.md",
+    "SKILL.md": "SKILL.market.md",
+    "README.md": "README.market.md",
     "LICENSE": "LICENSE",
     "_icon.png": "_icon.png",
     "references/compat.md": "references/compat.md",
