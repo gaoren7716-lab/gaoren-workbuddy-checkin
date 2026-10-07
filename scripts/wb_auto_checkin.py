@@ -29,20 +29,17 @@ from __future__ import annotations
 
 import argparse
 import base64
-import http.client
 import json
 import os
-import ssl
 import sys
 import time
-import urllib.parse
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wbipc_client import (            # noqa: E402
     WbipcClient, WbipcError, is_available, load_endpoint)
 
-APP_VERSION = "1.2.1"   # 单一事实来源：SKILL.md 的 version 与握手上报的客户端版本都取这里
+APP_VERSION = "1.2.2"   # 单一事实来源：SKILL.md 的 version 与握手上报的客户端版本都取这里
 TRAVEL_HOST_PATH = "/activity/growth/buddy/travel"
 # 结果契约：每一步的合法状态集合（agent 只按这张表判断，不要自行推理）
 STATUS_SET = {

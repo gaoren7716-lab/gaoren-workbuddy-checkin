@@ -5,7 +5,7 @@ name: gaoren-workbuddy-checkin
 display_name: WorkBuddy 自动签到（自研版·零凭据）
 display_name_en: WorkBuddy Auto Check-in (Zero-Credential)
 summary: WorkBuddy 加油站每日签到 + 每月连签 + 猫猫旅行。零凭据设计：只通过 WorkBuddy 客户端自身的本机 RPC 通道发请求，脚本不读登录态、不解密 token、不落盘任何文件。纯 Python 标准库，MIT 许可。
-version: 1.2.1
+version: 1.2.2
 author: gaoren
 license: MIT
 homepage: https://github.com/gaoren7716-lab/gaoren-workbuddy-checkin
