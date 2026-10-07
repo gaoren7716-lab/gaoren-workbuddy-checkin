@@ -72,10 +72,13 @@ def ticket_id(ticket: str) -> str:
 
 
 class WbipcClient:
-    def __init__(self, endpoint: str, ticket: str, timeout: float = 20.0):
+    def __init__(self, endpoint: str, ticket: str, timeout: float = 20.0,
+                 client_version: str | None = None):
         self.endpoint = endpoint
         self.ticket = ticket
         self.timeout = timeout
+        # 上报给桌面端的客户端版本；由调用方传入，避免两处硬编码不一致
+        self.client_version = client_version or "unknown"
         self._io = None
         self._next_id = 0
         self.epoch = ""
@@ -147,7 +150,7 @@ class WbipcClient:
             "client_nonce": client_nonce,
             "ticket_id": ticket_id(self.ticket),
             "client": {"kind": "cli", "id": "gaoren-checkin",
-                       "version": _client_version()},
+                       "version": self.client_version},
         })
         frame = self._read()
         if frame.get("type") == "session_hello_error":
@@ -209,22 +212,16 @@ class WbipcClient:
         return self.call("%s/http.fetch" % ch, params, mode="call")
 
 
-def _client_version() -> str:
-    try:
-        from importlib import metadata
-        return "1.1.0"
-    except Exception:  # noqa: BLE001
-        return "1.1.0"
-
-
-def is_available(path: str | None = None) -> tuple[bool, str]:
+def is_available(path: str | None = None,
+                 client_version: str | None = None) -> tuple[bool, str]:
     """通道是否可用（不发起完整调用，只检查文件存在与管道可连）。"""
     try:
         endpoint, ticket = load_endpoint(path)
     except (OSError, KeyError, ValueError) as exc:
         return False, "读取 endpoint.json 失败：%s" % exc
     try:
-        with WbipcClient(endpoint, ticket, timeout=8) as c:
+        with WbipcClient(endpoint, ticket, timeout=8,
+                         client_version=client_version) as c:
             c.handshake()
         return True, "可用（epoch=%s）" % c.epoch
     except (WbipcError, OSError) as exc:
@@ -237,7 +234,8 @@ if __name__ == "__main__":
     if ok:
         endpoint, ticket = load_endpoint()
         t0 = time.time()
-        with WbipcClient(endpoint, ticket) as c:
+        with WbipcClient(endpoint, ticket,
+                        client_version="dev") as c:
             c.handshake()
             ch = c.get_pipe()
             print("channel =", ch)

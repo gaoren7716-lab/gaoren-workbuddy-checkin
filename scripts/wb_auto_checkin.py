@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gaoren-workbuddy-checkin · WorkBuddy 加油站每日签到（自研 v1.1.0）
+"""gaoren-workbuddy-checkin · WorkBuddy 加油站每日签到（自研）
 
 作者：gaoren ｜ MIT ｜ 零第三方依赖，仅用 Python 标准库
 
@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wbipc_client import (            # noqa: E402
     WbipcClient, WbipcError, is_available, load_endpoint)
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"   # 单一事实来源：SKILL.md 的 version 与握手上报的客户端版本都取这里
 TRAVEL_HOST_PATH = "/activity/growth/buddy/travel"
 # 结果契约：每一步的合法状态集合（agent 只按这张表判断，不要自行推理）
 STATUS_SET = {
@@ -105,7 +105,7 @@ class WbipcTransport(Transport):
 
     def __init__(self) -> None:
         endpoint, ticket = load_endpoint()
-        self.c = WbipcClient(endpoint, ticket)
+        self.c = WbipcClient(endpoint, ticket, client_version=APP_VERSION)
         self.c.handshake()
         self.channel = self.c.get_pipe()
 
@@ -309,7 +309,7 @@ def doctor() -> int:
     checks: list[tuple[str, bool, str]] = []
     print("gaoren-workbuddy-checkin %s ｜ 环境自检 %s\n" % (APP_VERSION, now()))
 
-    ok, msg = is_available()
+    ok, msg = is_available(client_version=APP_VERSION)
     checks.append(("客户端本机 RPC 通道", ok, msg))
     print("  %s 通道 D（客户端 RPC）：%s" % ("✅" if ok else "❌", msg))
 
