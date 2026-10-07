@@ -39,7 +39,6 @@ import urllib.parse
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import wb_crypto as crypto          # noqa: E402
 from wbipc_client import (            # noqa: E402
     WbipcClient, WbipcError, is_available, load_endpoint)
 
@@ -64,14 +63,21 @@ def home_dir() -> str:
         os.path.expanduser("~"), ".workbuddy", "gaoren-checkin")
 
 
-def log_path() -> str:
-    return os.environ.get("GAOREN_CHECKIN_LOG") or os.path.join(home_dir(), "checkin.log")
+def log_path() -> str | None:
+    """日志默认**不落盘**；只有显式设置 GAOREN_CHECKIN_LOG 才写文件。"""
+    return os.environ.get("GAOREN_CHECKIN_LOG") or None
 
 
 def write_log(line: str) -> None:
+    """追加一行结果到日志。默认无操作 —— 本技能默认不写任何文件。"""
+    path = log_path()
+    if not path:
+        return
     try:
-        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
-        with open(log_path(), "a", encoding="utf-8") as f:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
     except OSError:
         pass
@@ -116,125 +122,31 @@ class WbipcTransport(Transport):
         self.c.close()
 
 
-class HttpTransport(Transport):
-    """通道 A/B/C：自带 accessToken 直连官方接口（连接复用，省 TLS 握手）。"""
+def _load_credentials_module():
+    """懒加载直连凭据模块。
 
-    def __init__(self, token: str, domain: str, label: str) -> None:
-        self.name = label
-        self.token = token
-        self.domain = domain
-        self._conn: http.client.HTTPSConnection | None = None
-
-    def _connection(self) -> http.client.HTTPSConnection:
-        if self._conn is None:
-            self._conn = http.client.HTTPSConnection(
-                self.domain, timeout=20, context=ssl.create_default_context())
-        return self._conn
-
-    def request(self, method, path, body=None, query=None):
-        url = path
-        if query:
-            url += "?" + urllib.parse.urlencode(
-                {k: str(v) for k, v in query.items()})
-        payload = json.dumps(body or {}).encode("utf-8") if method == "POST" else None
-        headers = {
-            "Authorization": "Bearer %s" % self.token,
-            "Accept": "application/json",
-            "User-Agent": os.environ.get("GAOREN_UA", "WorkBuddy-CLI/%s" % APP_VERSION),
-        }
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-        for attempt in (1, 2):
-            try:
-                conn = self._connection()
-                conn.request(method, url, body=payload, headers=headers)
-                resp = conn.getresponse()
-                raw = resp.read().decode("utf-8", "replace")
-                return resp.status, (json.loads(raw) if raw.strip() else {})
-            except (http.client.HTTPException, OSError) as exc:
-                self.close()
-                if attempt == 2:
-                    return 0, {"msg": "网络错误：%s" % exc}
-        return 0, {"msg": "未知网络错误"}
-
-    def close(self) -> None:
-        try:
-            if self._conn is not None:
-                self._conn.close()
-        except OSError:
-            pass
-        finally:
-            self._conn = None
-
-
-def login_state_path() -> str:
-    env = os.environ.get("GAOREN_LOGIN_STATE")
-    if env:
-        return env
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "CodeBuddyExtension", "Data", "Public", "auth",
-                            "workbuddy-desktop.info")
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/CodeBuddyExtension"
-                                  "/Data/Public/auth/workbuddy-desktop.info")
-    return os.path.expanduser("~/.config/CodeBuddyExtension/Data/Public/auth/"
-                              "workbuddy-desktop.info")
+    **市场分发版不包含该模块** —— 默认通道（客户端 RPC）零凭据，
+    不读登录态、不解密 token、不碰任何凭据。
+    只有显式指定 `--channel A/C/B` 时才会用到它。
+    """
+    try:
+        import wb_credentials
+        return wb_credentials
+    except ImportError:
+        return None
 
 
 def open_transport(prefer: str = "auto") -> tuple[Transport | None, str]:
-    """按优先级选通道，返回 (transport, 说明)。"""
-    order = [prefer] if prefer != "auto" else ["D", "A", "C", "B"]
-    for ch in order:
-        try:
-            if ch == "D":
-                t = WbipcTransport()
-                return t, "客户端本机 RPC（零凭据）"
-            if ch == "A":
-                tok, dom, src = _from_login_state()
-                if tok:
-                    return HttpTransport(tok, dom, "direct"), "登录态解密（%s）" % src
-            elif ch == "C":
-                tok = os.environ.get("GAOREN_ACCESS_TOKEN", "").strip()
-                if tok.count(".") == 2:
-                    return HttpTransport(tok, os.environ.get("GAOREN_AUTH_DOMAIN",
-                                      "www.codebuddy.cn"), "direct"), "环境变量"
-            elif ch == "B":
-                f = os.path.join(home_dir(), "token.txt")
-                if os.path.isfile(f):
-                    tok = open(f, encoding="utf-8").read().strip()
-                    if tok.count(".") == 2:
-                        dom = "www.codebuddy.cn"
-                        df = os.path.join(home_dir(), "domain.txt")
-                        if os.path.isfile(df):
-                            dom = open(df, encoding="utf-8").read().strip() or dom
-                        return HttpTransport(tok, dom, "direct"), "令牌文件"
-        except (WbipcError, OSError, ValueError, KeyError):
-            continue
-    return None, "无可用通道"
-
-
-def _from_login_state() -> tuple[str | None, str, str]:
-    path = login_state_path()
-    if not os.path.isfile(path):
-        return None, "", "找不到登录态"
-    state = json.load(open(path, encoding="utf-8"))
-    auth = state.get("auth") or {}
-    domain = auth.get("domain") or "www.codebuddy.cn"
-    raw = auth.get("accessToken")
-    if isinstance(raw, str) and raw:
-        return raw, domain, "明文"
-    if not isinstance(raw, dict) or not raw.get("envelope"):
-        return None, "", "登录态无 accessToken"
-    env = json.loads(base64.b64decode(raw["envelope"]))
-    key, source = crypto.obtain_key(env["keyId"], data_dir=os.path.dirname(path),
-                                    verbose=bool(os.environ.get("GAOREN_VERBOSE")))
-    if not key:
-        return None, "", "取不到运行时密钥"
+    """选通道。默认只用 D（零凭据）；显式指定 A/C/B 时才加载凭据模块。"""
+    if prefer in ("A", "C", "B"):
+        cred = _load_credentials_module()
+        if cred is None:
+            return None, "本发行版不含直连凭据模块（仅客户端 RPC 通道）"
+        return cred.open_direct()
     try:
-        return crypto.open_envelope(raw["envelope"], key), domain, "解密/密钥来自%s" % source
-    except (ValueError, KeyError) as exc:
-        return None, "", "解密失败：%s" % exc
+        return WbipcTransport(), "客户端本机 RPC（零凭据）"
+    except (WbipcError, OSError, ValueError, KeyError) as exc:
+        return None, "客户端 RPC 不可用：%s" % exc
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +313,9 @@ def doctor() -> int:
     checks.append(("客户端本机 RPC 通道", ok, msg))
     print("  %s 通道 D（客户端 RPC）：%s" % ("✅" if ok else "❌", msg))
 
-    path = login_state_path()
-    exists = os.path.isfile(path)
+    _cred = _load_credentials_module()
+    path = _cred.login_state_path() if _cred else ""
+    exists = bool(path) and os.path.isfile(path)
     detail = path if exists else "未找到（通道 D 可用时不影响）"
     if exists:
         try:
@@ -559,7 +472,11 @@ def main() -> int:
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
     if args.self_test:
-        return crypto.self_test()
+        if _load_credentials_module() is None:
+            print("本发行版不含加密模块（默认通道零凭据，无需加密自测）")
+            return 0
+        import wb_crypto
+        return wb_crypto.self_test()
     if args.doctor:
         return doctor()
     try:
