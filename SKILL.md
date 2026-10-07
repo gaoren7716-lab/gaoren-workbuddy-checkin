@@ -1,14 +1,26 @@
 ---
+slug: gaoren-workbuddy-checkin
+displayName: WorkBuddy 自动签到（自研版）
 name: gaoren-workbuddy-checkin
 display_name: WorkBuddy 自动签到（自研版）
 display_name_en: WorkBuddy Auto Check-in (Own Build)
-description: WorkBuddy「Buddy 加油站」每日签到自动化 Skill，作者 gaoren 自研，MIT 许可，零第三方依赖（纯 Python 标准库，自带 AES-256-GCM 实现）。当用户说"每天自动签到 / 自动领 Buddy 加油站积分 / 现在签个到 / 帮我签一下 / 检查签到环境 / 猫猫旅行 / 派猫猫 / 签到通知 / Buddy 加油站"时使用。支持三条凭据通道（本机登录态解密 / 令牌文件 / 环境变量），带只读探测模式（--probe 绝不发起写请求）、幂等领取、猫猫旅行先领后派、脱敏日志。Windows 需客户端处于运行登录状态。
-description_zh: WorkBuddy「Buddy 加油站」每日签到自动化 Skill，自研实现，MIT 许可。
-description_en: Self-developed WorkBuddy Buddy Station daily check-in skill. MIT licensed, stdlib only.
+summary: WorkBuddy 加油站每日签到自动化。自研实现，纯 Python 标准库（含自写 AES-256-GCM 与登录态解密），零第三方依赖，MIT 许可。带只读探测、幂等领取、猫猫旅行与脱敏日志。
 version: 1.0.0
 author: gaoren
 license: MIT
+homepage: https://github.com/gaoren7716-lab/gaoren-workbuddy-checkin
 category: 自动化
+tags:
+  - 签到
+  - 自动化
+  - Buddy加油站
+  - 积分
+  - Windows
+  - 隐私
+  - 零依赖
+description: WorkBuddy「Buddy 加油站」每日签到自动化 Skill，作者 gaoren 自研，MIT 许可，零第三方依赖（纯 Python 标准库，自带 AES-256-GCM 实现）。当用户说"每天自动签到 / 自动领 Buddy 加油站积分 / 现在签个到 / 帮我签一下 / 检查签到环境 / 猫猫旅行 / 派猫猫 / 签到通知 / Buddy 加油站"时使用。支持三条凭据通道（本机登录态解密 / 令牌文件 / 环境变量），带只读探测模式（--probe 绝不发起写请求）、幂等领取、猫猫旅行先领后派、脱敏日志。Windows 需客户端处于运行登录状态。
+description_zh: WorkBuddy「Buddy 加油站」每日签到自动化 Skill，自研实现，MIT 许可。
+description_en: Self-developed WorkBuddy Buddy Station daily check-in skill. MIT licensed, stdlib only.
 agent_created: true
 ---
 
